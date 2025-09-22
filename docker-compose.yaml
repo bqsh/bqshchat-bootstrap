@@ -1,0 +1,51 @@
+version: "3.8"
+services:
+  tor_a:
+    image: dperson/torproxy:latest
+    restart: unless-stopped
+    volumes:
+      - ./tor/hs_a:/var/lib/tor/hidden_service
+      - ./tor/torrc:/etc/tor/torrc:ro
+    ports:
+      - "19050:9050"   # socks5 наружу для отладки
+    networks: [forumnet]
+
+  app_a:
+    build: ./app
+    depends_on: [tor_a]
+    environment:
+      - APP_PORT=9000
+    networks: [forumnet]
+    ports:
+      - "19001:9000"   # только для локального теста, в реале onion-only
+    volumes:
+      - ./tor/hs_a:/onion
+
+  tor_b:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    container_name: p2p_node_b
+    environment:
+      - APP_PORT=4001
+      - PEER_MULTIADDRS=/onion3/xvuai3mrdkc6ftqkopvkmjytlhoqq6b4lo6dyzr2zb4c6pqmhepx7bad.onion:4001/p2p/12D3KooWKPPnFCedj8CBYSFRoP7EhXZkJhCV16apditPRXRuM57i
+    volumes:
+      - ./tor/hs_b:/var/lib/tor/hidden_service
+      - ./tor/torrc:/etc/tor/torrc:ro
+    ports:
+      - "29001:4001"
+
+  app_b:
+    build: ./app
+    depends_on: [tor_b]
+    environment:
+      - APP_PORT=9000
+    networks: [forumnet]
+    ports:
+      - "29001:9000"
+    volumes:
+      - ./tor/hs_b:/onion
+
+networks:
+  forumnet:
+    driver: bridge
