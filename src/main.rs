@@ -6,8 +6,9 @@ use libp2p::{
         transport::{upgrade::Version, Boxed, Transport},
     },
     gossipsub::{
-        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour, ConfigBuilder as GossipsubConfigBuilder,
-        Event, IdentTopic, IdentityTransform, MessageAuthenticity, TopicHash, ValidationMode,
+        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour,
+        ConfigBuilder as GossipsubConfigBuilder, Event, IdentTopic, IdentityTransform,
+        MessageAuthenticity, TopicHash, ValidationMode,
     },
     identity,
     noise::Config as NoiseConfig,
@@ -45,8 +46,6 @@ const DIAL_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_SEEN_IDS: usize = 1_000_000;
 const MAX_RTT_SAMPLES: usize = 200_000;
 
-// ✅ КРИТИЧНО: дефолт gossipsub = 2048 байт на RPC, и 1KB payload часто не пролезает из-за protobuf+signature.
-// Ставим 64KiB чтобы 1KB/4KB работали стабильно.
 const GOSSIPSUB_MAX_TRANSMIT_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,16 +343,16 @@ fn decode_msg(bytes: &[u8]) -> Option<ParsedMsg<'_>> {
 }
 
 fn make_gossipsub(
-    id_keys: &identity::Keypair,
+    _id_keys: &identity::Keypair,
 ) -> Result<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>> {
     let cfg = GossipsubConfigBuilder::default()
-        .validation_mode(ValidationMode::Strict)
-        // ✅ ФИКС ДЛЯ 1KB/4KB PAYLOAD
+        .validation_mode(ValidationMode::Anonymous)
+        .allow_self_origin(true)
         .max_transmit_size(GOSSIPSUB_MAX_TRANSMIT_SIZE)
         .build()?;
 
     GossipBehaviour::<IdentityTransform, AllowAllSubscriptionFilter>::new(
-        MessageAuthenticity::Signed(id_keys.clone()),
+        MessageAuthenticity::Anonymous,
         cfg,
     )
     .map_err(|e| anyhow!(e))
@@ -732,7 +731,6 @@ async fn run_bench_windowed(
             }
         }
 
-        // ✅ если всё отправлено и всё подтверждено — выходим
         if sent_total == requested && metrics.pending.is_empty() {
             break;
         }
@@ -800,7 +798,14 @@ async fn sender_run_stack(
 ) -> Result<Vec<BenchRow>> {
     println!("Dial {} ...", dial_addr);
 
-    let dial_time = dial_wait_ready(&mut swarm, dial_addr, remote_peer, topic.hash(), DIAL_READY_TIMEOUT).await?;
+    let dial_time = dial_wait_ready(
+        &mut swarm,
+        dial_addr,
+        remote_peer,
+        topic.hash(),
+        DIAL_READY_TIMEOUT,
+    )
+    .await?;
 
     println!("Connected + Subscribed. dial_ms={}", dial_time.as_millis());
 
@@ -1039,7 +1044,15 @@ async fn main() -> Result<()> {
             println!("gossipsub.max_transmit_size = {} bytes\n", GOSSIPSUB_MAX_TRANSMIT_SIZE);
 
             if stack == Stack::All {
-                return sender_all_mode(&id_keys, local_peer, remote_peer, ip, base_port, webrtc_full).await;
+                return sender_all_mode(
+                    &id_keys,
+                    local_peer,
+                    remote_peer,
+                    ip,
+                    base_port,
+                    webrtc_full,
+                )
+                .await;
             }
 
             let transport = build_transport_single(stack, &id_keys, HashMap::new())?;
