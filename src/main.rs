@@ -6,9 +6,8 @@ use libp2p::{
         transport::{upgrade::Version, Boxed, Transport},
     },
     gossipsub::{
-        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour,
-        ConfigBuilder as GossipsubConfigBuilder, Event, IdentTopic, IdentityTransform,
-        MessageAuthenticity, ValidationMode,
+        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour, ConfigBuilder as GossipsubConfigBuilder,
+        Event, IdentTopic, IdentityTransform, MessageAuthenticity, TopicHash, ValidationMode,
     },
     identity,
     noise::Config as NoiseConfig,
@@ -31,8 +30,6 @@ use sysinfo::{
 };
 use tokio::io::{self, AsyncBufReadExt};
 use tokio::time;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 const KIND_DATA: u8 = 1;
 const KIND_ACK: u8 = 2;
@@ -42,6 +39,13 @@ const DEFAULT_COUNTS: &[usize] = &[
 ];
 
 const PAYLOAD_SIZE: usize = 32;
+
+const IN_FLIGHT: usize = 1024;
+const RUN_TIMEOUT: Duration = Duration::from_secs(120);
+const DIAL_READY_TIMEOUT: Duration = Duration::from_secs(20);
+
+const MAX_SEEN_IDS: usize = 1_000_000;
+const MAX_RTT_SAMPLES: usize = 200_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
@@ -90,10 +94,7 @@ fn stack_name(s: Stack) -> &'static str {
     }
 }
 
-/// ✅ ВАЖНО: чтобы в all не было "Address in use"
-/// tcp и ws оба используют TCP listener, поэтому им нужны разные порты.
-/// quic/udp тоже вынесем на отдельные порты для чистоты эксперимента.
-fn port_for(stack: Stack, base: u16) -> u16 {
+fn port_for_stack(base: u16, stack: Stack) -> u16 {
     match stack {
         Stack::Tcp | Stack::Tor => base,
         Stack::WebSocket => base.saturating_add(1),
@@ -114,8 +115,9 @@ struct Metrics {
     data_sent: u64,
     data_delivered: u64,
 
-    pending: HashMap<u64, Instant>,
+    pending: HashMap<u64, (Instant, usize)>,
     rtt_us: Vec<u64>,
+    rtt_seen: u64,
 
     jitter_us: f64,
     prev_rtt_us: Option<u64>,
@@ -140,6 +142,7 @@ impl Metrics {
 
             pending: HashMap::new(),
             rtt_us: Vec::new(),
+            rtt_seen: 0,
 
             jitter_us: 0.0,
             prev_rtt_us: None,
@@ -163,6 +166,7 @@ impl Metrics {
 
         self.pending.clear();
         self.rtt_us.clear();
+        self.rtt_seen = 0;
 
         self.jitter_us = 0.0;
         self.prev_rtt_us = None;
@@ -189,7 +193,7 @@ impl Metrics {
         self.data_sent = self.data_sent.saturating_add(1);
         self.note_outgoing(full_msg_bytes);
         self.payload_bytes_sent = self.payload_bytes_sent.saturating_add(payload_bytes as u64);
-        self.pending.insert(id, Instant::now());
+        self.pending.insert(id, (Instant::now(), payload_bytes));
     }
 
     fn note_ack_send(&mut self, bytes: usize) {
@@ -197,7 +201,7 @@ impl Metrics {
     }
 
     fn note_ack_received(&mut self, id: u64) {
-        if let Some(sent_at) = self.pending.remove(&id) {
+        if let Some((sent_at, payload_bytes)) = self.pending.remove(&id) {
             let us = sent_at.elapsed().as_micros() as u64;
 
             if let Some(prev) = self.prev_rtt_us {
@@ -206,12 +210,23 @@ impl Metrics {
             }
             self.prev_rtt_us = Some(us);
 
-            self.rtt_us.push(us);
+            self.rtt_seen = self.rtt_seen.saturating_add(1);
+            if self.rtt_us.len() < MAX_RTT_SAMPLES {
+                self.rtt_us.push(us);
+            } else {
+                let j = rand::random::<u64>() % self.rtt_seen.max(1);
+                if (j as usize) < MAX_RTT_SAMPLES {
+                    self.rtt_us[j as usize] = us;
+                }
+            }
+
             self.data_delivered = self.data_delivered.saturating_add(1);
+            self.payload_bytes_delivered =
+                self.payload_bytes_delivered.saturating_add(payload_bytes as u64);
         }
     }
 
-    fn note_payload_delivered(&mut self, payload_bytes: usize) {
+    fn note_payload_delivered_receiver_side(&mut self, payload_bytes: usize) {
         self.payload_bytes_delivered =
             self.payload_bytes_delivered.saturating_add(payload_bytes as u64);
     }
@@ -263,11 +278,7 @@ fn percentile_us(v: &[u64], p: f64) -> Option<u64> {
 }
 
 enum ParsedMsg<'a> {
-    Data {
-        id: u64,
-        sender: PeerId,
-        payload: &'a [u8],
-    },
+    Data { id: u64, sender: PeerId, payload: &'a [u8] },
     Ack { id: u64, target: PeerId },
 }
 
@@ -313,15 +324,25 @@ fn decode_msg(bytes: &[u8]) -> Option<ParsedMsg<'_>> {
     match kind {
         KIND_DATA => {
             let payload = &bytes[10 + len..];
-            Some(ParsedMsg::Data {
-                id,
-                sender: peer,
-                payload,
-            })
+            Some(ParsedMsg::Data { id, sender: peer, payload })
         }
         KIND_ACK => Some(ParsedMsg::Ack { id, target: peer }),
         _ => None,
     }
+}
+
+fn make_gossipsub(
+    id_keys: &identity::Keypair,
+) -> Result<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>> {
+    let cfg = GossipsubConfigBuilder::default()
+        .validation_mode(ValidationMode::Strict)
+        .build()?;
+
+    GossipBehaviour::<IdentityTransform, AllowAllSubscriptionFilter>::new(
+        MessageAuthenticity::Signed(id_keys.clone()),
+        cfg,
+    )
+    .map_err(|e| anyhow!(e))
 }
 
 fn build_transport_single(
@@ -402,7 +423,8 @@ fn build_transport_all(id_keys: &identity::Keypair) -> Result<Boxed<(PeerId, Str
     Ok(t.boxed())
 }
 
-fn listen_multiaddr(stack: Stack, port: u16) -> Result<Multiaddr> {
+fn listen_multiaddr(stack: Stack, base_port: u16) -> Result<Multiaddr> {
+    let port = port_for_stack(base_port, stack);
     Ok(match stack {
         Stack::Tcp | Stack::Tor => format!("/ip4/0.0.0.0/tcp/{}", port).parse()?,
         Stack::WebSocket => format!("/ip4/0.0.0.0/tcp/{}/ws", port).parse()?,
@@ -415,10 +437,12 @@ fn listen_multiaddr(stack: Stack, port: u16) -> Result<Multiaddr> {
 fn dial_addr_for_stack(
     stack: Stack,
     ip: IpAddr,
-    port: u16,
+    base_port: u16,
     peer: PeerId,
     webrtc_full: Option<Multiaddr>,
 ) -> Result<Multiaddr> {
+    let port = port_for_stack(base_port, stack);
+
     let s = match stack {
         Stack::Tcp => format!("/ip4/{}/tcp/{}/p2p/{}", ip, port, peer),
         Stack::WebSocket => format!("/ip4/{}/tcp/{}/ws/p2p/{}", ip, port, peer),
@@ -428,7 +452,7 @@ fn dial_addr_for_stack(
                 return Ok(ma);
             }
             return Err(anyhow!(
-                "Для udp/webrtc нужен полный multiaddr с /certhash/... (скопируй из Peer2 логов)"
+                "Для udp/webrtc нужен полный multiaddr с /certhash/.../p2p/... (скопируй из Peer2 логов)"
             ));
         }
         Stack::Tor => return Err(anyhow!("Tor dial requires onion multiaddr")),
@@ -471,7 +495,10 @@ impl ResourceMeter {
     fn sample(&mut self) {
         self.sys.refresh_processes(ProcessesToUpdate::All, false);
 
-        if let Some(p) = self.sys.process(sysinfo::Pid::from_u32(std::process::id())) {
+        if let Some(p) = self
+            .sys
+            .process(sysinfo::Pid::from_u32(std::process::id()))
+        {
             self.cpu_samples.push(p.cpu_usage());
             self.mem_samples_kb.push(p.memory());
         }
@@ -502,35 +529,33 @@ impl ResourceMeter {
 struct BenchRow {
     stack: Stack,
     count: usize,
+    dial_ms: u128,
     delivery_percent: f64,
     median_us: Option<u64>,
     p95_us: Option<u64>,
     p99_us: Option<u64>,
     jitter_us: f64,
-    outgoing_bytes: u64,
-    incoming_bytes: u64,
     goodput_mbps: f64,
     overhead: f64,
     cpu_avg: f32,
-    cpu_max: f32,
     mem_avg: f64,
-    mem_max: f64,
 }
 
 fn print_table(rows: &[BenchRow]) {
     println!();
-    println!("--------------------------------------------------------------------------------------------------------------");
+    println!("---------------------------------------------------------------------------------------------------------------");
     println!(
-        "{:>6} | {:>10} | {:>8} | {:>9} | {:>9} | {:>9} | {:>8} | {:>10} | {:>10} | {:>9} | {:>9}",
-        "stack", "count", "deliv%", "medianus", "p95us", "p99us", "jitter", "goodput", "overhead", "cpu_avg", "mem_avg"
+        "{:>6} | {:>10} | {:>7} | {:>8} | {:>9} | {:>9} | {:>9} | {:>8} | {:>9} | {:>9} | {:>7} | {:>7}",
+        "stack", "count", "dialms", "deliv%", "medianus", "p95us", "p99us", "jitter", "goodput", "overhead", "cpu", "mem"
     );
-    println!("--------------------------------------------------------------------------------------------------------------");
+    println!("---------------------------------------------------------------------------------------------------------------");
 
     for r in rows {
         println!(
-            "{:>6} | {:>10} | {:>7.2}% | {:>9} | {:>9} | {:>9} | {:>7.1} | {:>8.3} | {:>8.3} | {:>8.2} | {:>8.2}",
+            "{:>6} | {:>10} | {:>7} | {:>7.2}% | {:>9} | {:>9} | {:>9} | {:>7.1} | {:>8.3} | {:>8.3} | {:>6.2} | {:>6.2}",
             stack_name(r.stack),
             r.count,
+            r.dial_ms,
             r.delivery_percent,
             r.median_us.map(|x| x.to_string()).unwrap_or_else(|| "n/a".into()),
             r.p95_us.map(|x| x.to_string()).unwrap_or_else(|| "n/a".into()),
@@ -543,22 +568,8 @@ fn print_table(rows: &[BenchRow]) {
         );
     }
 
-    println!("--------------------------------------------------------------------------------------------------------------");
+    println!("---------------------------------------------------------------------------------------------------------------");
     println!();
-}
-
-fn make_gossipsub(
-    id_keys: &identity::Keypair,
-) -> Result<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>> {
-    let cfg = GossipsubConfigBuilder::default()
-        .validation_mode(ValidationMode::Strict)
-        .build()?;
-
-    GossipBehaviour::<IdentityTransform, AllowAllSubscriptionFilter>::new(
-        MessageAuthenticity::Signed(id_keys.clone()),
-        cfg,
-    )
-    .map_err(|e| anyhow!(e))
 }
 
 async fn handle_message(
@@ -577,11 +588,13 @@ async fn handle_message(
                     return;
                 }
 
-                if !metrics.seen_data_ids.insert(id) {
-                    metrics.duplicates = metrics.duplicates.saturating_add(1);
+                if metrics.seen_data_ids.len() < MAX_SEEN_IDS {
+                    if !metrics.seen_data_ids.insert(id) {
+                        metrics.duplicates = metrics.duplicates.saturating_add(1);
+                    }
                 }
 
-                metrics.note_payload_delivered(payload.len());
+                metrics.note_payload_delivered_receiver_side(payload.len());
 
                 let ack = encode_ack(id, &sender);
                 if swarm.behaviour_mut().publish(topic.clone(), ack.clone()).is_ok() {
@@ -597,23 +610,47 @@ async fn handle_message(
     }
 }
 
-async fn dial_wait_connected(
+async fn dial_wait_ready(
     swarm: &mut Swarm<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>>,
-    remote: Multiaddr,
+    remote_addr: Multiaddr,
     remote_peer: PeerId,
+    topic_hash: TopicHash,
     timeout: Duration,
-) -> Result<()> {
-    swarm.dial(remote)?;
+) -> Result<Duration> {
+    let t0 = Instant::now();
+
+    swarm.behaviour_mut().add_explicit_peer(&remote_peer);
+
+    // dial может ругаться если уже коннект есть — это не критично
+    if let Err(e) = swarm.dial(remote_addr) {
+        eprintln!("dial warning: {:?}", e);
+    }
 
     let deadline = Instant::now() + timeout;
+    let mut connected = false;
+    let mut subscribed = false;
+
     loop {
+        if connected && subscribed {
+            return Ok(t0.elapsed());
+        }
+
         if Instant::now() > deadline {
-            return Err(anyhow!("dial timeout"));
+            return Err(anyhow!(
+                "dial-ready timeout: connected={} subscribed={}",
+                connected,
+                subscribed
+            ));
         }
 
         match swarm.select_next_some().await {
             SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == remote_peer => {
-                return Ok(())
+                connected = true;
+            }
+            SwarmEvent::Behaviour(Event::Subscribed { peer_id, topic }) => {
+                if peer_id == remote_peer && topic == topic_hash {
+                    subscribed = true;
+                }
             }
             _ => {}
         }
@@ -630,26 +667,38 @@ async fn run_bench(
     metrics.reset_run();
 
     let payload = vec![b'x'; PAYLOAD_SIZE];
-
-    for _ in 0..count {
-        let id = metrics.alloc_id();
-        let msg = encode_data(id, &local_peer, &payload);
-        if swarm.behaviour_mut().publish(topic.clone(), msg.clone()).is_ok() {
-            metrics.note_data_send(id, msg.len(), payload.len());
-        }
-    }
-
     let started = Instant::now();
-    let timeout = Duration::from_secs(120);
+
+    let mut sent_total: usize = 0;
 
     let mut meter = ResourceMeter::new();
     let mut tick = time::interval(Duration::from_secs(1));
 
     loop {
-        if metrics.pending.is_empty() {
+        // отправляем порциями (окно)
+        while sent_total < count && metrics.pending.len() < IN_FLIGHT {
+            let id = metrics.alloc_id();
+            let msg = encode_data(id, &local_peer, &payload);
+
+            match swarm.behaviour_mut().publish(topic.clone(), msg.clone()) {
+                Ok(_) => {
+                    metrics.note_data_send(id, msg.len(), payload.len());
+                    sent_total += 1;
+                }
+                Err(e) => {
+                    eprintln!("publish failed: {:?}", e);
+                    // если publish падает — смысл чуть подождать события
+                    break;
+                }
+            }
+        }
+
+        // условие завершения
+        if metrics.data_delivered as usize >= sent_total && sent_total == count && metrics.pending.is_empty() {
             break;
         }
-        if started.elapsed() > timeout {
+
+        if started.elapsed() > RUN_TIMEOUT {
             break;
         }
 
@@ -690,10 +739,10 @@ async fn receiver_loop(
                 handle_message(&mut swarm, &topic, local_peer, &mut metrics, &message).await;
             }
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                info!("ConnectionEstablished with {} via {:?}", peer_id, endpoint);
+                println!("ConnectionEstablished with {} via {:?}", peer_id, endpoint);
             }
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                info!("ConnectionClosed with {} cause={:?}", peer_id, cause);
+                println!("ConnectionClosed with {} cause={:?}", peer_id, cause);
             }
             _ => {}
         }
@@ -701,45 +750,53 @@ async fn receiver_loop(
 }
 
 async fn sender_run_stack(
-    swarm: &mut Swarm<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>>,
-    topic: &IdentTopic,
+    mut swarm: Swarm<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>>,
+    topic: IdentTopic,
     local_peer: PeerId,
     remote_peer: PeerId,
     dial_addr: Multiaddr,
     stack: Stack,
 ) -> Result<Vec<BenchRow>> {
     println!("Dial {} ...", dial_addr);
-    dial_wait_connected(swarm, dial_addr, remote_peer, Duration::from_secs(20)).await?;
-    println!("Connected.");
+
+    let dial_time = dial_wait_ready(
+        &mut swarm,
+        dial_addr,
+        remote_peer,
+        topic.hash(),
+        DIAL_READY_TIMEOUT,
+    )
+    .await?;
+
+    println!("Connected + Subscribed. dial_ms={}", dial_time.as_millis());
 
     let mut rows = Vec::new();
     let mut metrics = Metrics::new();
 
     for &count in DEFAULT_COUNTS {
-        let (elapsed, rs) = run_bench(swarm, topic, local_peer, count, &mut metrics).await?;
+        let (elapsed, rs) = run_bench(&mut swarm, &topic, local_peer, count, &mut metrics).await?;
 
         rows.push(BenchRow {
             stack,
             count,
+            dial_ms: dial_time.as_millis(),
             delivery_percent: metrics.delivery_percent(),
             median_us: metrics.median_rtt_us(),
             p95_us: metrics.p95_rtt_us(),
             p99_us: metrics.p99_rtt_us(),
             jitter_us: metrics.jitter_us,
-            outgoing_bytes: metrics.outgoing_bytes,
-            incoming_bytes: metrics.incoming_bytes,
             goodput_mbps: metrics.goodput_mbps(elapsed),
             overhead: metrics.overhead_ratio(),
             cpu_avg: rs.cpu_avg,
-            cpu_max: rs.cpu_max,
             mem_avg: rs.mem_avg_mb,
-            mem_max: rs.mem_max_mb,
         });
 
         println!(
-            "[{}] count={} delivery={:.2}% median={:?}us p95={:?}us p99={:?}us goodput={:.3} Mbps",
+            "[{}] count={} sent={} delivered={} ({:.2}%) median={:?}us p95={:?}us p99={:?}us goodput={:.3} Mbps",
             stack_name(stack),
             count,
+            metrics.data_sent,
+            metrics.data_delivered,
             metrics.delivery_percent(),
             metrics.median_rtt_us(),
             metrics.p95_rtt_us(),
@@ -751,64 +808,37 @@ async fn sender_run_stack(
     Ok(rows)
 }
 
-async fn sender_loop(
-    mut swarm: Swarm<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>>,
-    topic: IdentTopic,
+async fn sender_all_mode(
+    id_keys: &identity::Keypair,
     local_peer: PeerId,
     remote_peer: PeerId,
     ip: IpAddr,
     base_port: u16,
-    stack: Stack,
     webrtc_full: Option<Multiaddr>,
 ) -> Result<()> {
-    println!("=== Peer1 / Sender ===");
-    println!("Local PeerId: {}", local_peer);
-    println!("Remote PeerId: {}", remote_peer);
-    println!("stack = {:?}", stack);
-    println!("base_port = {}", base_port);
-    if stack == Stack::All {
-        println!(
-            "all ports: tcp={} ws={} quic={} udp={}",
-            port_for(Stack::Tcp, base_port),
-            port_for(Stack::WebSocket, base_port),
-            port_for(Stack::Quic, base_port),
-            port_for(Stack::WebRtcUdp, base_port)
-        );
-    }
-    println!();
-
-    let order = match stack {
-        Stack::All => vec![Stack::Tcp, Stack::WebSocket, Stack::Quic, Stack::WebRtcUdp],
-        other => vec![other],
-    };
+    let order = [Stack::Tcp, Stack::WebSocket, Stack::Quic, Stack::WebRtcUdp];
 
     let mut all_rows = Vec::new();
 
     for st in order {
-        if st == Stack::Tor {
-            println!("[tor] пока пропускаем в all режиме");
-            continue;
-        }
-
         if st == Stack::WebRtcUdp && webrtc_full.is_none() {
             println!("[udp] нет полного webrtc multiaddr с /certhash/... → пропуск");
             continue;
         }
 
-        let p = port_for(st, base_port);
+        println!("--- RUN {} (port={}) ---", stack_name(st), port_for_stack(base_port, st));
 
-        println!("--- RUN {} (port={}) ---", stack_name(st), p);
+        let transport = build_transport_single(st, id_keys, HashMap::new())?;
+        let behaviour = make_gossipsub(id_keys)?;
+        let swarm_config = SwarmConfig::with_tokio_executor();
+        let mut swarm = Swarm::new(transport, behaviour, local_peer, swarm_config);
 
-        let dial_addr = dial_addr_for_stack(
-            st,
-            ip,
-            p,
-            remote_peer,
-            webrtc_full.clone(),
-        )?;
+        let topic = IdentTopic::new("forum/autos/board/general");
+        swarm.behaviour_mut().subscribe(&topic)?;
 
-        let rows =
-            sender_run_stack(&mut swarm, &topic, local_peer, remote_peer, dial_addr, st).await?;
+        let dial_addr = dial_addr_for_stack(st, ip, base_port, remote_peer, webrtc_full.clone())?;
+        let rows = sender_run_stack(swarm, topic, local_peer, remote_peer, dial_addr, st).await?;
+
         print_table(&rows);
         all_rows.extend(rows);
     }
@@ -819,12 +849,32 @@ async fn sender_loop(
     Ok(())
 }
 
+async fn sender_single_mode(
+    transport: Boxed<(PeerId, StreamMuxerBox)>,
+    id_keys: &identity::Keypair,
+    local_peer: PeerId,
+    remote_peer: PeerId,
+    ip: IpAddr,
+    base_port: u16,
+    stack: Stack,
+    webrtc_full: Option<Multiaddr>,
+) -> Result<()> {
+    let behaviour = make_gossipsub(id_keys)?;
+    let swarm_config = SwarmConfig::with_tokio_executor();
+    let mut swarm = Swarm::new(transport, behaviour, local_peer, swarm_config);
+
+    let topic = IdentTopic::new("forum/autos/board/general");
+    swarm.behaviour_mut().subscribe(&topic)?;
+
+    let dial_addr = dial_addr_for_stack(stack, ip, base_port, remote_peer, webrtc_full)?;
+    let rows = sender_run_stack(swarm, topic, local_peer, remote_peer, dial_addr, stack).await?;
+
+    print_table(&rows);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .try_init();
-
     let mut stdin = io::BufReader::new(io::stdin()).lines();
 
     println!("role: receiver(peer2) | sender(peer1)");
@@ -844,7 +894,7 @@ async fn main() -> Result<()> {
     };
 
     let mut onion_map: HashMap<Multiaddr, SocketAddr> = HashMap::new();
-    if stack == Stack::Tor {
+    if stack == Stack::Tor && role == Role::Receiver {
         println!("onion multiaddr (пример: /onion3/...:443):");
         let onion_in = read_line(&mut stdin).await?;
         if !onion_in.trim().is_empty() {
@@ -857,34 +907,36 @@ async fn main() -> Result<()> {
     let id_keys = identity::Keypair::generate_ed25519();
     let local_peer = PeerId::from(id_keys.public());
 
-    let transport = match stack {
-        Stack::All => build_transport_all(&id_keys)?,
-        _ => build_transport_single(stack, &id_keys, onion_map)?,
-    };
-
-    let behaviour = make_gossipsub(&id_keys)?;
-    let swarm_config = SwarmConfig::with_tokio_executor();
-    let mut swarm = Swarm::new(transport, behaviour, local_peer, swarm_config);
-
-    let topic = IdentTopic::new("forum/autos/board/general");
-    swarm.behaviour_mut().subscribe(&topic)?;
-
-    match stack {
-        Stack::All => {
-            for st in [Stack::Tcp, Stack::WebSocket, Stack::Quic, Stack::WebRtcUdp] {
-                let p = port_for(st, base_port);
-                let la = listen_multiaddr(st, p)?;
-                swarm.listen_on(la)?;
-            }
-        }
-        _ => {
-            let la = listen_multiaddr(stack, base_port)?;
-            swarm.listen_on(la)?;
-        }
-    }
-
     match role {
-        Role::Receiver => receiver_loop(swarm, topic, local_peer).await,
+        Role::Receiver => {
+            let transport = match stack {
+                Stack::All => build_transport_all(&id_keys)?,
+                _ => build_transport_single(stack, &id_keys, onion_map)?,
+            };
+
+            let behaviour = make_gossipsub(&id_keys)?;
+            let swarm_config = SwarmConfig::with_tokio_executor();
+            let mut swarm = Swarm::new(transport, behaviour, local_peer, swarm_config);
+
+            let topic = IdentTopic::new("forum/autos/board/general");
+            swarm.behaviour_mut().subscribe(&topic)?;
+
+            match stack {
+                Stack::All => {
+                    for st in [Stack::Tcp, Stack::WebSocket, Stack::Quic, Stack::WebRtcUdp] {
+                        let la = listen_multiaddr(st, base_port)?;
+                        swarm.listen_on(la)?;
+                    }
+                }
+                _ => {
+                    let la = listen_multiaddr(stack, base_port)?;
+                    swarm.listen_on(la)?;
+                }
+            }
+
+            receiver_loop(swarm, topic, local_peer).await
+        }
+
         Role::Sender => {
             println!("remote peerId:");
             let peer_in = read_line(&mut stdin).await?;
@@ -903,9 +955,36 @@ async fn main() -> Result<()> {
                 }
             }
 
-            sender_loop(
-                swarm,
-                topic,
+            println!("=== Peer1 / Sender ===");
+            println!("Local PeerId: {}", local_peer);
+            println!("Remote PeerId: {}", remote_peer);
+            println!("stack = {:?}", stack);
+            println!("base_port = {}", base_port);
+            println!(
+                "all ports: tcp={} ws={} quic={} udp={}",
+                port_for_stack(base_port, Stack::Tcp),
+                port_for_stack(base_port, Stack::WebSocket),
+                port_for_stack(base_port, Stack::Quic),
+                port_for_stack(base_port, Stack::WebRtcUdp),
+            );
+            println!();
+
+            if stack == Stack::All {
+                return sender_all_mode(
+                    &id_keys,
+                    local_peer,
+                    remote_peer,
+                    ip,
+                    base_port,
+                    webrtc_full,
+                )
+                .await;
+            }
+
+            let transport = build_transport_single(stack, &id_keys, HashMap::new())?;
+            sender_single_mode(
+                transport,
+                &id_keys,
                 local_peer,
                 remote_peer,
                 ip,
