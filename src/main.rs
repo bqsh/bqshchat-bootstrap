@@ -6,8 +6,9 @@ use libp2p::{
         transport::{upgrade::Version, Boxed, Transport},
     },
     gossipsub::{
-        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour, ConfigBuilder as GossipsubConfigBuilder,
-        Event, IdentTopic, IdentityTransform, MessageAuthenticity, TopicHash, ValidationMode,
+        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour,
+        ConfigBuilder as GossipsubConfigBuilder, Event, IdentTopic, IdentityTransform,
+        MessageAuthenticity, TopicHash, ValidationMode,
     },
     identity,
     noise::Config as NoiseConfig,
@@ -34,13 +35,12 @@ use tokio::time;
 const KIND_DATA: u8 = 1;
 const KIND_ACK: u8 = 2;
 
-const DEFAULT_COUNTS: &[usize] = &[
-    1, 10, 100, 1000, 10000, 20000
-];
+const DEFAULT_COUNTS: &[usize] = &[1, 10, 100, 1000, 5000];
 
-const PAYLOAD_SIZE: usize = 32;
+const PAYLOAD_SIZES: &[usize] = &[32, 1024, 4096];
 
-const IN_FLIGHT: usize = 1024;
+const IN_FLIGHT: usize = 100;
+
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 const DIAL_READY_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -115,6 +115,8 @@ struct Metrics {
     data_sent: u64,
     data_delivered: u64,
 
+    publish_failed: u64,
+
     pending: HashMap<u64, (Instant, usize)>,
     rtt_us: Vec<u64>,
     rtt_seen: u64,
@@ -140,6 +142,8 @@ impl Metrics {
             data_sent: 0,
             data_delivered: 0,
 
+            publish_failed: 0,
+
             pending: HashMap::new(),
             rtt_us: Vec::new(),
             rtt_seen: 0,
@@ -163,6 +167,8 @@ impl Metrics {
 
         self.data_sent = 0;
         self.data_delivered = 0;
+
+        self.publish_failed = 0;
 
         self.pending.clear();
         self.rtt_us.clear();
@@ -194,6 +200,10 @@ impl Metrics {
         self.note_outgoing(full_msg_bytes);
         self.payload_bytes_sent = self.payload_bytes_sent.saturating_add(payload_bytes as u64);
         self.pending.insert(id, (Instant::now(), payload_bytes));
+    }
+
+    fn note_publish_failed(&mut self) {
+        self.publish_failed = self.publish_failed.saturating_add(1);
     }
 
     fn note_ack_send(&mut self, bytes: usize) {
@@ -412,12 +422,12 @@ fn build_transport_single(
 
 fn build_transport_all(id_keys: &identity::Keypair) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
     let tcp = build_transport_single(Stack::Tcp, id_keys, HashMap::new())?;
-    let quic = build_transport_single(Stack::Quic, id_keys, HashMap::new())?;
     let ws = build_transport_single(Stack::WebSocket, id_keys, HashMap::new())?;
+    let quic = build_transport_single(Stack::Quic, id_keys, HashMap::new())?;
     let udp = build_transport_single(Stack::WebRtcUdp, id_keys, HashMap::new())?;
 
-    let t = tcp.or_transport(quic).map(|either, _| either.into_inner());
-    let t = t.or_transport(ws).map(|either, _| either.into_inner());
+    let t = tcp.or_transport(ws).map(|either, _| either.into_inner());
+    let t = t.or_transport(quic).map(|either, _| either.into_inner());
     let t = t.or_transport(udp).map(|either, _| either.into_inner());
 
     Ok(t.boxed())
@@ -455,9 +465,10 @@ fn dial_addr_for_stack(
                 "Для udp/webrtc нужен полный multiaddr с /certhash/.../p2p/... (скопируй из Peer2 логов)"
             ));
         }
-        Stack::Tor => return Err(anyhow!("Tor dial requires onion multiaddr")),
+        Stack::Tor => return Err(anyhow!("Tor dial requires onion multiaddr (пока не автоматизировали)")),
         Stack::All => return Err(anyhow!("use per-stack dial in all mode")),
     };
+
     Ok(s.parse()?)
 }
 
@@ -528,8 +539,15 @@ impl ResourceMeter {
 #[derive(Clone)]
 struct BenchRow {
     stack: Stack,
-    count: usize,
+    payload: usize,
+
+    requested: usize,
+    sent: u64,
+    delivered: u64,
+    publish_failed: u64,
+
     dial_ms: u128,
+
     delivery_percent: f64,
     median_us: Option<u64>,
     p95_us: Option<u64>,
@@ -543,18 +561,23 @@ struct BenchRow {
 
 fn print_table(rows: &[BenchRow]) {
     println!();
-    println!("---------------------------------------------------------------------------------------------------------------");
+    println!("-------------------------------------------------------------------------------------------------------------------------------------------------------------------");
     println!(
-        "{:>6} | {:>10} | {:>7} | {:>8} | {:>9} | {:>9} | {:>9} | {:>8} | {:>9} | {:>9} | {:>7} | {:>7}",
-        "stack", "count", "dialms", "deliv%", "medianus", "p95us", "p99us", "jitter", "goodput", "overhead", "cpu", "mem"
+        "{:>6} | {:>7} | {:>8} | {:>7} | {:>7} | {:>7} | {:>7} | {:>8} | {:>9} | {:>9} | {:>9} | {:>8} | {:>9} | {:>9} | {:>7} | {:>7}",
+        "stack", "payload", "req", "sent", "deliv", "fail", "dialms",
+        "deliv%", "medianus", "p95us", "p99us", "jitter", "goodput", "overhead", "cpu", "mem"
     );
-    println!("---------------------------------------------------------------------------------------------------------------");
+    println!("-------------------------------------------------------------------------------------------------------------------------------------------------------------------");
 
     for r in rows {
         println!(
-            "{:>6} | {:>10} | {:>7} | {:>7.2}% | {:>9} | {:>9} | {:>9} | {:>7.1} | {:>8.3} | {:>8.3} | {:>6.2} | {:>6.2}",
+            "{:>6} | {:>7} | {:>8} | {:>7} | {:>7} | {:>7} | {:>7} | {:>7.2}% | {:>9} | {:>9} | {:>9} | {:>7.1} | {:>8.3} | {:>8.3} | {:>6.2} | {:>6.2}",
             stack_name(r.stack),
-            r.count,
+            r.payload,
+            r.requested,
+            r.sent,
+            r.delivered,
+            r.publish_failed,
             r.dial_ms,
             r.delivery_percent,
             r.median_us.map(|x| x.to_string()).unwrap_or_else(|| "n/a".into()),
@@ -568,7 +591,7 @@ fn print_table(rows: &[BenchRow]) {
         );
     }
 
-    println!("---------------------------------------------------------------------------------------------------------------");
+    println!("-------------------------------------------------------------------------------------------------------------------------------------------------------------------");
     println!();
 }
 
@@ -621,7 +644,6 @@ async fn dial_wait_ready(
 
     swarm.behaviour_mut().add_explicit_peer(&remote_peer);
 
-    // dial может ругаться если уже коннект есть — это не критично
     if let Err(e) = swarm.dial(remote_addr) {
         eprintln!("dial warning: {:?}", e);
     }
@@ -657,16 +679,17 @@ async fn dial_wait_ready(
     }
 }
 
-async fn run_bench(
+async fn run_bench_windowed(
     swarm: &mut Swarm<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>>,
     topic: &IdentTopic,
     local_peer: PeerId,
-    count: usize,
+    requested: usize,
+    payload_size: usize,
     metrics: &mut Metrics,
 ) -> Result<(Duration, ResourceStats)> {
     metrics.reset_run();
 
-    let payload = vec![b'x'; PAYLOAD_SIZE];
+    let payload = vec![b'x'; payload_size];
     let started = Instant::now();
 
     let mut sent_total: usize = 0;
@@ -675,8 +698,7 @@ async fn run_bench(
     let mut tick = time::interval(Duration::from_secs(1));
 
     loop {
-        // отправляем порциями (окно)
-        while sent_total < count && metrics.pending.len() < IN_FLIGHT {
+        while sent_total < requested && metrics.pending.len() < IN_FLIGHT {
             let id = metrics.alloc_id();
             let msg = encode_data(id, &local_peer, &payload);
 
@@ -685,16 +707,17 @@ async fn run_bench(
                     metrics.note_data_send(id, msg.len(), payload.len());
                     sent_total += 1;
                 }
-                Err(e) => {
-                    eprintln!("publish failed: {:?}", e);
-                    // если publish падает — смысл чуть подождать события
-                    break;
+                Err(_e) => {
+                    metrics.note_publish_failed();
+                    break; 
                 }
             }
         }
 
-        // условие завершения
-        if metrics.data_delivered as usize >= sent_total && sent_total == count && metrics.pending.is_empty() {
+        let sent_ok = metrics.data_sent as usize;
+        let delivered_ok = metrics.data_delivered as usize;
+
+        if sent_total == requested && metrics.pending.is_empty() && delivered_ok >= sent_ok {
             break;
         }
 
@@ -738,12 +761,6 @@ async fn receiver_loop(
             SwarmEvent::Behaviour(Event::Message { message, .. }) => {
                 handle_message(&mut swarm, &topic, local_peer, &mut metrics, &message).await;
             }
-            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                println!("ConnectionEstablished with {} via {:?}", peer_id, endpoint);
-            }
-            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                println!("ConnectionClosed with {} cause={:?}", peer_id, cause);
-            }
             _ => {}
         }
     }
@@ -768,41 +785,69 @@ async fn sender_run_stack(
     )
     .await?;
 
-    println!("Connected + Subscribed. dial_ms={}", dial_time.as_millis());
+    println!(
+        "Connected + Subscribed. dial_ms={}",
+        dial_time.as_millis()
+    );
 
     let mut rows = Vec::new();
     let mut metrics = Metrics::new();
 
-    for &count in DEFAULT_COUNTS {
-        let (elapsed, rs) = run_bench(&mut swarm, &topic, local_peer, count, &mut metrics).await?;
+    for &payload_size in PAYLOAD_SIZES {
+        println!("--- payload={} bytes ---", payload_size);
 
-        rows.push(BenchRow {
-            stack,
-            count,
-            dial_ms: dial_time.as_millis(),
-            delivery_percent: metrics.delivery_percent(),
-            median_us: metrics.median_rtt_us(),
-            p95_us: metrics.p95_rtt_us(),
-            p99_us: metrics.p99_rtt_us(),
-            jitter_us: metrics.jitter_us,
-            goodput_mbps: metrics.goodput_mbps(elapsed),
-            overhead: metrics.overhead_ratio(),
-            cpu_avg: rs.cpu_avg,
-            mem_avg: rs.mem_avg_mb,
-        });
+        for &requested in DEFAULT_COUNTS {
+            let (elapsed, rs) = run_bench_windowed(
+                &mut swarm,
+                &topic,
+                local_peer,
+                requested,
+                payload_size,
+                &mut metrics,
+            )
+            .await?;
 
-        println!(
-            "[{}] count={} sent={} delivered={} ({:.2}%) median={:?}us p95={:?}us p99={:?}us goodput={:.3} Mbps",
-            stack_name(stack),
-            count,
-            metrics.data_sent,
-            metrics.data_delivered,
-            metrics.delivery_percent(),
-            metrics.median_rtt_us(),
-            metrics.p95_rtt_us(),
-            metrics.p99_rtt_us(),
-            metrics.goodput_mbps(elapsed),
-        );
+            let sent = metrics.data_sent;
+            let delivered = metrics.data_delivered;
+            let deliv_pct = metrics.delivery_percent();
+
+            rows.push(BenchRow {
+                stack,
+                payload: payload_size,
+
+                requested,
+                sent,
+                delivered,
+                publish_failed: metrics.publish_failed,
+
+                dial_ms: dial_time.as_millis(),
+
+                delivery_percent: deliv_pct,
+                median_us: metrics.median_rtt_us(),
+                p95_us: metrics.p95_rtt_us(),
+                p99_us: metrics.p99_rtt_us(),
+                jitter_us: metrics.jitter_us,
+                goodput_mbps: metrics.goodput_mbps(elapsed),
+                overhead: metrics.overhead_ratio(),
+                cpu_avg: rs.cpu_avg,
+                mem_avg: rs.mem_avg_mb,
+            });
+
+            println!(
+                "[{}] payload={}B req={} sent={} deliv={} ({:.2}%) fail={} median={:?}us p95={:?}us p99={:?}us goodput={:.3} Mbps",
+                stack_name(stack),
+                payload_size,
+                requested,
+                sent,
+                delivered,
+                deliv_pct,
+                metrics.publish_failed,
+                metrics.median_rtt_us(),
+                metrics.p95_rtt_us(),
+                metrics.p99_rtt_us(),
+                metrics.goodput_mbps(elapsed),
+            );
+        }
     }
 
     Ok(rows)
@@ -826,7 +871,11 @@ async fn sender_all_mode(
             continue;
         }
 
-        println!("--- RUN {} (port={}) ---", stack_name(st), port_for_stack(base_port, st));
+        println!(
+            "\n==================== RUN {} (port={}) ====================",
+            stack_name(st),
+            port_for_stack(base_port, st)
+        );
 
         let transport = build_transport_single(st, id_keys, HashMap::new())?;
         let behaviour = make_gossipsub(id_keys)?;
@@ -955,19 +1004,22 @@ async fn main() -> Result<()> {
                 }
             }
 
-            println!("=== Peer1 / Sender ===");
+            println!("\n=== Peer1 / Sender ===");
             println!("Local PeerId: {}", local_peer);
             println!("Remote PeerId: {}", remote_peer);
             println!("stack = {:?}", stack);
             println!("base_port = {}", base_port);
             println!(
-                "all ports: tcp={} ws={} quic={} udp={}",
+                "ports: tcp={} ws={} quic={} udp={}",
                 port_for_stack(base_port, Stack::Tcp),
                 port_for_stack(base_port, Stack::WebSocket),
                 port_for_stack(base_port, Stack::Quic),
                 port_for_stack(base_port, Stack::WebRtcUdp),
             );
-            println!();
+            println!(
+                "window(IN_FLIGHT) = {} | payloads={:?} | counts={:?}\n",
+                IN_FLIGHT, PAYLOAD_SIZES, DEFAULT_COUNTS
+            );
 
             if stack == Stack::All {
                 return sender_all_mode(
