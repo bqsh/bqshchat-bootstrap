@@ -35,7 +35,7 @@ const KIND_DATA: u8 = 1;
 const KIND_ACK: u8 = 2;
 
 const DEFAULT_COUNTS: &[usize] = &[
-    1, 10, 100, 1000, 10_000, 100_000, 1_000_000, 10_000_000,
+    1, 10, 100, 1000, 10000, 20000
 ];
 
 const PAYLOAD_SIZE: usize = 32;
