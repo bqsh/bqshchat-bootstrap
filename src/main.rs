@@ -35,7 +35,7 @@ use tokio::time;
 const KIND_DATA: u8 = 1;
 const KIND_ACK: u8 = 2;
 
-const DEFAULT_COUNTS: &[usize] = &[1, 10, 100, 1000, 5000];
+const DEFAULT_COUNTS: &[usize] = &[1, 10, 100, 1000];
 
 const PAYLOAD_SIZES: &[usize] = &[32, 1024, 4096];
 
