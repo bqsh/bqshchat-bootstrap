@@ -6,9 +6,8 @@ use libp2p::{
         transport::{upgrade::Version, Boxed, Transport},
     },
     gossipsub::{
-        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour,
-        ConfigBuilder as GossipsubConfigBuilder, Event, IdentTopic, IdentityTransform,
-        MessageAuthenticity, TopicHash, ValidationMode,
+        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour, ConfigBuilder as GossipsubConfigBuilder,
+        Event, IdentTopic, IdentityTransform, MessageAuthenticity, TopicHash, ValidationMode,
     },
     identity,
     noise::Config as NoiseConfig,
@@ -36,7 +35,6 @@ const KIND_DATA: u8 = 1;
 const KIND_ACK: u8 = 2;
 
 const DEFAULT_COUNTS: &[usize] = &[1, 10, 100, 1000];
-
 const PAYLOAD_SIZES: &[usize] = &[32, 1024, 4096];
 
 const IN_FLIGHT: usize = 100;
@@ -46,6 +44,10 @@ const DIAL_READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 const MAX_SEEN_IDS: usize = 1_000_000;
 const MAX_RTT_SAMPLES: usize = 200_000;
+
+// ✅ КРИТИЧНО: дефолт gossipsub = 2048 байт на RPC, и 1KB payload часто не пролезает из-за protobuf+signature.
+// Ставим 64KiB чтобы 1KB/4KB работали стабильно.
+const GOSSIPSUB_MAX_TRANSMIT_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
@@ -346,6 +348,8 @@ fn make_gossipsub(
 ) -> Result<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>> {
     let cfg = GossipsubConfigBuilder::default()
         .validation_mode(ValidationMode::Strict)
+        // ✅ ФИКС ДЛЯ 1KB/4KB PAYLOAD
+        .max_transmit_size(GOSSIPSUB_MAX_TRANSMIT_SIZE)
         .build()?;
 
     GossipBehaviour::<IdentityTransform, AllowAllSubscriptionFilter>::new(
@@ -506,10 +510,7 @@ impl ResourceMeter {
     fn sample(&mut self) {
         self.sys.refresh_processes(ProcessesToUpdate::All, false);
 
-        if let Some(p) = self
-            .sys
-            .process(sysinfo::Pid::from_u32(std::process::id()))
-        {
+        if let Some(p) = self.sys.process(sysinfo::Pid::from_u32(std::process::id())) {
             self.cpu_samples.push(p.cpu_usage());
             self.mem_samples_kb.push(p.memory());
         }
@@ -620,8 +621,19 @@ async fn handle_message(
                 metrics.note_payload_delivered_receiver_side(payload.len());
 
                 let ack = encode_ack(id, &sender);
-                if swarm.behaviour_mut().publish(topic.clone(), ack.clone()).is_ok() {
-                    metrics.note_ack_send(ack.len());
+
+                match swarm.behaviour_mut().publish(topic.clone(), ack.clone()) {
+                    Ok(_) => {
+                        metrics.note_ack_send(ack.len());
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[receiver] publish ACK failed: {:?} (ack_len={}B id={})",
+                            e,
+                            ack.len(),
+                            id
+                        );
+                    }
                 }
             }
             ParsedMsg::Ack { id, target } => {
@@ -707,21 +719,33 @@ async fn run_bench_windowed(
                     metrics.note_data_send(id, msg.len(), payload.len());
                     sent_total += 1;
                 }
-                Err(_e) => {
+                Err(e) => {
                     metrics.note_publish_failed();
-                    break; 
+                    eprintln!(
+                        "[sender] publish DATA failed: {:?} (payload={}B msg_len={}B)",
+                        e,
+                        payload.len(),
+                        msg.len()
+                    );
+                    break;
                 }
             }
         }
 
-        let sent_ok = metrics.data_sent as usize;
-        let delivered_ok = metrics.data_delivered as usize;
-
-        if sent_total == requested && metrics.pending.is_empty() && delivered_ok >= sent_ok {
+        // ✅ если всё отправлено и всё подтверждено — выходим
+        if sent_total == requested && metrics.pending.is_empty() {
             break;
         }
 
         if started.elapsed() > RUN_TIMEOUT {
+            eprintln!(
+                "[sender] RUN_TIMEOUT hit: requested={} sent_total={} data_sent={} delivered={} pending={}",
+                requested,
+                sent_total,
+                metrics.data_sent,
+                metrics.data_delivered,
+                metrics.pending.len()
+            );
             break;
         }
 
@@ -776,19 +800,9 @@ async fn sender_run_stack(
 ) -> Result<Vec<BenchRow>> {
     println!("Dial {} ...", dial_addr);
 
-    let dial_time = dial_wait_ready(
-        &mut swarm,
-        dial_addr,
-        remote_peer,
-        topic.hash(),
-        DIAL_READY_TIMEOUT,
-    )
-    .await?;
+    let dial_time = dial_wait_ready(&mut swarm, dial_addr, remote_peer, topic.hash(), DIAL_READY_TIMEOUT).await?;
 
-    println!(
-        "Connected + Subscribed. dial_ms={}",
-        dial_time.as_millis()
-    );
+    println!("Connected + Subscribed. dial_ms={}", dial_time.as_millis());
 
     let mut rows = Vec::new();
     let mut metrics = Metrics::new();
@@ -834,7 +848,7 @@ async fn sender_run_stack(
             });
 
             println!(
-                "[{}] payload={}B req={} sent={} deliv={} ({:.2}%) fail={} median={:?}us p95={:?}us p99={:?}us goodput={:.3} Mbps",
+                "[{}] payload={}B req={} sent={} deliv={} ({:.2}%) fail={} pending={} median={:?}us p95={:?}us p99={:?}us goodput={:.3} Mbps overhead={:.3}",
                 stack_name(stack),
                 payload_size,
                 requested,
@@ -842,10 +856,12 @@ async fn sender_run_stack(
                 delivered,
                 deliv_pct,
                 metrics.publish_failed,
+                metrics.pending.len(),
                 metrics.median_rtt_us(),
                 metrics.p95_rtt_us(),
                 metrics.p99_rtt_us(),
                 metrics.goodput_mbps(elapsed),
+                metrics.overhead_ratio(),
             );
         }
     }
@@ -1017,20 +1033,13 @@ async fn main() -> Result<()> {
                 port_for_stack(base_port, Stack::WebRtcUdp),
             );
             println!(
-                "window(IN_FLIGHT) = {} | payloads={:?} | counts={:?}\n",
+                "window(IN_FLIGHT) = {} | payloads={:?} | counts={:?}",
                 IN_FLIGHT, PAYLOAD_SIZES, DEFAULT_COUNTS
             );
+            println!("gossipsub.max_transmit_size = {} bytes\n", GOSSIPSUB_MAX_TRANSMIT_SIZE);
 
             if stack == Stack::All {
-                return sender_all_mode(
-                    &id_keys,
-                    local_peer,
-                    remote_peer,
-                    ip,
-                    base_port,
-                    webrtc_full,
-                )
-                .await;
+                return sender_all_mode(&id_keys, local_peer, remote_peer, ip, base_port, webrtc_full).await;
             }
 
             let transport = build_transport_single(stack, &id_keys, HashMap::new())?;
