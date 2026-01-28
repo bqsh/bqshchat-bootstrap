@@ -26,4 +26,4 @@ log = "0.4.27"
 tokio-socks = "0.5.2"
 torut = "0.2.1"
 lazy_static = "1.2.0"
-libp2p-tokio-socks5 = { path = "/home/bituum/RustroverProjects/rust-libp2p-tokio-socks5" }
+libp2p-tokio-socks5 = { path = "/root/src/rust-libp2p-tokio-socks5" }
