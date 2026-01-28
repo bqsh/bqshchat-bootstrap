@@ -6,9 +6,8 @@ use libp2p::{
         transport::{upgrade::Version, Boxed, Transport},
     },
     gossipsub::{
-        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour,
-        ConfigBuilder as GossipsubConfigBuilder, Event, IdentTopic, IdentityTransform,
-        MessageAuthenticity, TopicHash, ValidationMode,
+        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour, ConfigBuilder as GossipsubConfigBuilder, Event,
+        IdentTopic, IdentityTransform, MessageAuthenticity, MessageId, PublishError, TopicHash, ValidationMode,
     },
     identity,
     noise::Config as NoiseConfig,
@@ -21,14 +20,13 @@ use libp2p::{
 use libp2p_tokio_socks5::{Socks5Config, Socks5Transport};
 use rand::thread_rng;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
     time::{Duration, Instant},
 };
-use sysinfo::{
-    CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
-};
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tokio::io::{self, AsyncBufReadExt};
 use tokio::time;
 
@@ -232,14 +230,12 @@ impl Metrics {
             }
 
             self.data_delivered = self.data_delivered.saturating_add(1);
-            self.payload_bytes_delivered =
-                self.payload_bytes_delivered.saturating_add(payload_bytes as u64);
+            self.payload_bytes_delivered = self.payload_bytes_delivered.saturating_add(payload_bytes as u64);
         }
     }
 
     fn note_payload_delivered_receiver_side(&mut self, payload_bytes: usize) {
-        self.payload_bytes_delivered =
-            self.payload_bytes_delivered.saturating_add(payload_bytes as u64);
+        self.payload_bytes_delivered = self.payload_bytes_delivered.saturating_add(payload_bytes as u64);
     }
 
     fn delivery_percent(&self) -> f64 {
@@ -342,17 +338,31 @@ fn decode_msg(bytes: &[u8]) -> Option<ParsedMsg<'_>> {
     }
 }
 
+fn make_message_id(data: &[u8]) -> MessageId {
+    if let Some(pm) = decode_msg(data) {
+        match pm {
+            ParsedMsg::Data { id, sender, .. } => MessageId::from(format!("d:{}:{}", id, sender)),
+            ParsedMsg::Ack { id, target } => MessageId::from(format!("a:{}:{}", id, target)),
+        }
+    } else {
+        let mut h = DefaultHasher::new();
+        data.hash(&mut h);
+        MessageId::from(format!("raw:{:x}", h.finish()))
+    }
+}
+
 fn make_gossipsub(
-    _id_keys: &identity::Keypair,
+    id_keys: &identity::Keypair,
 ) -> Result<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>> {
     let cfg = GossipsubConfigBuilder::default()
-        .validation_mode(ValidationMode::Anonymous)
-        .allow_self_origin(true)
+        .validation_mode(ValidationMode::Strict)
+        .allow_self_origin(false)
         .max_transmit_size(GOSSIPSUB_MAX_TRANSMIT_SIZE)
+        .message_id_fn(|m| make_message_id(&m.data))
         .build()?;
 
     GossipBehaviour::<IdentityTransform, AllowAllSubscriptionFilter>::new(
-        MessageAuthenticity::Anonymous,
+        MessageAuthenticity::Signed(id_keys.clone()),
         cfg,
     )
     .map_err(|e| anyhow!(e))
@@ -611,20 +621,25 @@ async fn handle_message(
                     return;
                 }
 
-                if metrics.seen_data_ids.len() < MAX_SEEN_IDS {
-                    if !metrics.seen_data_ids.insert(id) {
-                        metrics.duplicates = metrics.duplicates.saturating_add(1);
-                    }
+                let first_seen = if metrics.seen_data_ids.len() < MAX_SEEN_IDS {
+                    metrics.seen_data_ids.insert(id)
+                } else {
+                    true
+                };
+
+                if !first_seen {
+                    metrics.duplicates = metrics.duplicates.saturating_add(1);
+                    return;
                 }
 
                 metrics.note_payload_delivered_receiver_side(payload.len());
 
                 let ack = encode_ack(id, &sender);
-
                 match swarm.behaviour_mut().publish(topic.clone(), ack.clone()) {
                     Ok(_) => {
                         metrics.note_ack_send(ack.len());
                     }
+                    Err(PublishError::Duplicate) => {}
                     Err(e) => {
                         eprintln!(
                             "[receiver] publish ACK failed: {:?} (ack_len={}B id={})",
@@ -718,6 +733,14 @@ async fn run_bench_windowed(
                     metrics.note_data_send(id, msg.len(), payload.len());
                     sent_total += 1;
                 }
+                Err(PublishError::NoPeersSubscribedToTopic) => {
+                    metrics.note_publish_failed();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(PublishError::Duplicate) => {
+                    metrics.note_publish_failed();
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
                 Err(e) => {
                     metrics.note_publish_failed();
                     eprintln!(
@@ -726,7 +749,7 @@ async fn run_bench_windowed(
                         payload.len(),
                         msg.len()
                     );
-                    break;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
         }
@@ -780,6 +803,12 @@ async fn receiver_loop(
             SwarmEvent::NewListenAddr { address, .. } => {
                 println!("Listening on {}", address);
             }
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                swarm.behaviour_mut().add_explicit_peer(&peer_id);
+            }
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                swarm.behaviour_mut().remove_explicit_peer(&peer_id);
+            }
             SwarmEvent::Behaviour(Event::Message { message, .. }) => {
                 handle_message(&mut swarm, &topic, local_peer, &mut metrics, &message).await;
             }
@@ -808,6 +837,8 @@ async fn sender_run_stack(
     .await?;
 
     println!("Connected + Subscribed. dial_ms={}", dial_time.as_millis());
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let mut rows = Vec::new();
     let mut metrics = Metrics::new();
