@@ -1,27 +1,27 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId,
     core::{
         muxing::StreamMuxerBox,
-        transport::{Boxed, Transport, upgrade::Version},
+        transport::{upgrade::Version, Boxed, Transport},
     },
     gossipsub::{
-        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour,
-        ConfigBuilder as GossipsubConfigBuilder, Event, IdentTopic, IdentityTransform,
-        MessageAuthenticity, MessageId, PublishError, TopicHash, ValidationMode,
+        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour, ConfigBuilder as GossipsubConfigBuilder,
+        Event, IdentTopic, IdentityTransform, MessageAuthenticity, MessageId, PublishError, TopicHash,
+        ValidationMode,
     },
     identity,
     noise::Config as NoiseConfig,
     swarm::{Config as SwarmConfig, Swarm, SwarmEvent},
-    tcp::{Config as TcpConfig, tokio::Transport as TcpTransport},
+    tcp::{tokio::Transport as TcpTransport, Config as TcpConfig},
     websocket,
     yamux::Config as YamuxConfig,
+    Multiaddr, PeerId,
 };
 use libp2p_tokio_socks5::{Socks5Config, Socks5Transport};
 use rand::thread_rng;
 use std::{
-    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
@@ -32,6 +32,7 @@ use sysinfo::{
 };
 use tokio::io::{self, AsyncBufReadExt};
 use tokio::time;
+use tracing::{debug, error, info, warn};
 
 const KIND_DATA: u8 = 1;
 const KIND_ACK: u8 = 2;
@@ -233,16 +234,14 @@ impl Metrics {
             }
 
             self.data_delivered = self.data_delivered.saturating_add(1);
-            self.payload_bytes_delivered = self
-                .payload_bytes_delivered
-                .saturating_add(payload_bytes as u64);
+            self.payload_bytes_delivered =
+                self.payload_bytes_delivered.saturating_add(payload_bytes as u64);
         }
     }
 
     fn note_payload_delivered_receiver_side(&mut self, payload_bytes: usize) {
-        self.payload_bytes_delivered = self
-            .payload_bytes_delivered
-            .saturating_add(payload_bytes as u64);
+        self.payload_bytes_delivered =
+            self.payload_bytes_delivered.saturating_add(payload_bytes as u64);
     }
 
     fn delivery_percent(&self) -> f64 {
@@ -292,15 +291,8 @@ fn percentile_us(v: &[u64], p: f64) -> Option<u64> {
 }
 
 enum ParsedMsg<'a> {
-    Data {
-        id: u64,
-        sender: PeerId,
-        payload: &'a [u8],
-    },
-    Ack {
-        id: u64,
-        target: PeerId,
-    },
+    Data { id: u64, sender: PeerId, payload: &'a [u8] },
+    Ack { id: u64, target: PeerId },
 }
 
 fn encode_data(id: u64, sender: &PeerId, payload: &[u8]) -> Vec<u8> {
@@ -345,11 +337,7 @@ fn decode_msg(bytes: &[u8]) -> Option<ParsedMsg<'_>> {
     match kind {
         KIND_DATA => {
             let payload = &bytes[10 + len..];
-            Some(ParsedMsg::Data {
-                id,
-                sender: peer,
-                payload,
-            })
+            Some(ParsedMsg::Data { id, sender: peer, payload })
         }
         KIND_ACK => Some(ParsedMsg::Ack { id, target: peer }),
         _ => None,
@@ -375,6 +363,7 @@ fn make_gossipsub(
     let cfg = GossipsubConfigBuilder::default()
         .validation_mode(ValidationMode::Strict)
         .allow_self_origin(false)
+        .flood_publish(true)
         .max_transmit_size(GOSSIPSUB_MAX_TRANSMIT_SIZE)
         .message_id_fn(|m| make_message_id(&m.data))
         .build()?;
@@ -496,11 +485,7 @@ fn dial_addr_for_stack(
                 "Для udp/webrtc нужен полный multiaddr с /certhash/.../p2p/... (скопируй из Peer2 логов)"
             ));
         }
-        Stack::Tor => {
-            return Err(anyhow!(
-                "Tor dial requires onion multiaddr (пока не автоматизировали)"
-            ));
-        }
+        Stack::Tor => return Err(anyhow!("Tor dial requires onion multiaddr (пока не автоматизировали)")),
         Stack::All => return Err(anyhow!("use per-stack dial in all mode")),
     };
 
@@ -531,16 +516,11 @@ impl ResourceMeter {
         let mut sys = System::new_with_specifics(refresh);
         sys.refresh_processes(ProcessesToUpdate::All, false);
 
-        Self {
-            sys,
-            cpu_samples: Vec::new(),
-            mem_samples_kb: Vec::new(),
-        }
+        Self { sys, cpu_samples: Vec::new(), mem_samples_kb: Vec::new() }
     }
 
     fn sample(&mut self) {
         self.sys.refresh_processes(ProcessesToUpdate::All, false);
-
         if let Some(p) = self.sys.process(sysinfo::Pid::from_u32(std::process::id())) {
             self.cpu_samples.push(p.cpu_usage());
             self.mem_samples_kb.push(p.memory());
@@ -593,31 +573,13 @@ struct BenchRow {
 
 fn print_table(rows: &[BenchRow]) {
     println!();
-    println!(
-        "-------------------------------------------------------------------------------------------------------------------------------------------------------------------"
-    );
+    println!("-------------------------------------------------------------------------------------------------------------------------------------------------------------------");
     println!(
         "{:>6} | {:>7} | {:>8} | {:>7} | {:>7} | {:>7} | {:>7} | {:>8} | {:>9} | {:>9} | {:>9} | {:>8} | {:>9} | {:>9} | {:>7} | {:>7}",
-        "stack",
-        "payload",
-        "req",
-        "sent",
-        "deliv",
-        "fail",
-        "dialms",
-        "deliv%",
-        "medianus",
-        "p95us",
-        "p99us",
-        "jitter",
-        "goodput",
-        "overhead",
-        "cpu",
-        "mem"
+        "stack", "payload", "req", "sent", "deliv", "fail", "dialms",
+        "deliv%", "medianus", "p95us", "p99us", "jitter", "goodput", "overhead", "cpu", "mem"
     );
-    println!(
-        "-------------------------------------------------------------------------------------------------------------------------------------------------------------------"
-    );
+    println!("-------------------------------------------------------------------------------------------------------------------------------------------------------------------");
 
     for r in rows {
         println!(
@@ -630,15 +592,9 @@ fn print_table(rows: &[BenchRow]) {
             r.publish_failed,
             r.dial_ms,
             r.delivery_percent,
-            r.median_us
-                .map(|x| x.to_string())
-                .unwrap_or_else(|| "n/a".into()),
-            r.p95_us
-                .map(|x| x.to_string())
-                .unwrap_or_else(|| "n/a".into()),
-            r.p99_us
-                .map(|x| x.to_string())
-                .unwrap_or_else(|| "n/a".into()),
+            r.median_us.map(|x| x.to_string()).unwrap_or_else(|| "n/a".into()),
+            r.p95_us.map(|x| x.to_string()).unwrap_or_else(|| "n/a".into()),
+            r.p99_us.map(|x| x.to_string()).unwrap_or_else(|| "n/a".into()),
             r.jitter_us,
             r.goodput_mbps,
             r.overhead,
@@ -647,9 +603,7 @@ fn print_table(rows: &[BenchRow]) {
         );
     }
 
-    println!(
-        "-------------------------------------------------------------------------------------------------------------------------------------------------------------------"
-    );
+    println!("-------------------------------------------------------------------------------------------------------------------------------------------------------------------");
     println!();
 }
 
@@ -664,11 +618,7 @@ async fn handle_message(
 
     if let Some(parsed) = decode_msg(&msg.data) {
         match parsed {
-            ParsedMsg::Data {
-                id,
-                sender,
-                payload,
-            } => {
+            ParsedMsg::Data { id, sender, payload } => {
                 if sender == local_peer {
                     return;
                 }
@@ -693,12 +643,7 @@ async fn handle_message(
                     }
                     Err(PublishError::Duplicate) => {}
                     Err(e) => {
-                        eprintln!(
-                            "[receiver] publish ACK failed: {:?} (ack_len={}B id={})",
-                            e,
-                            ack.len(),
-                            id
-                        );
+                        warn!(?e, ack_len = ack.len(), id, "receiver publish ACK failed");
                     }
                 }
             }
@@ -723,7 +668,7 @@ async fn dial_wait_ready(
     swarm.behaviour_mut().add_explicit_peer(&remote_peer);
 
     if let Err(e) = swarm.dial(remote_addr) {
-        eprintln!("dial warning: {:?}", e);
+        warn!(?e, "dial warning");
     }
 
     let deadline = Instant::now() + timeout;
@@ -746,11 +691,19 @@ async fn dial_wait_ready(
         match swarm.select_next_some().await {
             SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == remote_peer => {
                 connected = true;
+                debug!(%peer_id, "dial-ready: ConnectionEstablished");
             }
             SwarmEvent::Behaviour(Event::Subscribed { peer_id, topic }) => {
                 if peer_id == remote_peer && topic == topic_hash {
                     subscribed = true;
+                    debug!(%peer_id, "dial-ready: Subscribed");
                 }
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                warn!(?peer_id, ?error, "outgoing connection error");
+            }
+            SwarmEvent::IncomingConnectionError { error, .. } => {
+                warn!(?error, "incoming connection error");
             }
             _ => {}
         }
@@ -775,8 +728,12 @@ async fn run_bench_windowed(
     let mut meter = ResourceMeter::new();
     let mut tick = time::interval(Duration::from_secs(1));
 
+    let mut warned_no_peers = false;
+
     loop {
-        while sent_total < requested && metrics.pending.len() < IN_FLIGHT {
+        let mut burst = 0usize;
+
+        while sent_total < requested && metrics.pending.len() < IN_FLIGHT && burst < 64 {
             if started.elapsed() > RUN_TIMEOUT {
                 break;
             }
@@ -788,42 +745,41 @@ async fn run_bench_windowed(
                 Ok(_) => {
                     metrics.note_data_send(id, msg.len(), payload.len());
                     sent_total += 1;
+                    burst += 1;
                 }
                 Err(PublishError::NoPeersSubscribedToTopic) => {
                     metrics.note_publish_failed();
-                    break;
+                    if !warned_no_peers {
+                        warned_no_peers = true;
+                        warn!("publish -> NoPeersSubscribedToTopic");
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(PublishError::Duplicate) => {
                     metrics.note_publish_failed();
-                    break;
                 }
                 Err(e) => {
                     metrics.note_publish_failed();
-                    eprintln!(
-                        "[sender] publish DATA failed: {:?} (payload={}B msg_len={}B)",
-                        e,
-                        payload.len(),
-                        msg.len()
-                    );
-                    break;
+                    warn!(?e, payload = payload.len(), msg_len = msg.len(), "publish failed");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
-        }
 
-        tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        }
 
         if sent_total == requested && metrics.pending.is_empty() {
             break;
         }
 
         if started.elapsed() > RUN_TIMEOUT {
-            eprintln!(
-                "[sender] RUN_TIMEOUT hit: requested={} sent_total={} data_sent={} delivered={} pending={}",
+            warn!(
                 requested,
                 sent_total,
-                metrics.data_sent,
-                metrics.data_delivered,
-                metrics.pending.len()
+                data_sent = metrics.data_sent,
+                delivered = metrics.data_delivered,
+                pending = metrics.pending.len(),
+                "RUN_TIMEOUT hit"
             );
             break;
         }
@@ -831,10 +787,32 @@ async fn run_bench_windowed(
         tokio::select! {
             _ = tick.tick() => {
                 meter.sample();
+                debug!(
+                    sent_total,
+                    pending = metrics.pending.len(),
+                    delivered = metrics.data_delivered,
+                    failed = metrics.publish_failed,
+                    "tick"
+                );
             }
             ev = swarm.select_next_some() => {
-                if let SwarmEvent::Behaviour(Event::Message { message, .. }) = ev {
-                    handle_message(swarm, topic, local_peer, metrics, &message).await;
+                match ev {
+                    SwarmEvent::Behaviour(Event::Message { message, .. }) => {
+                        handle_message(swarm, topic, local_peer, metrics, &message).await;
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        debug!(%peer_id, ?endpoint, "bench: connection established");
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                        debug!(%peer_id, ?cause, "bench: connection closed");
+                    }
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        warn!(?peer_id, ?error, "outgoing connection error");
+                    }
+                    SwarmEvent::IncomingConnectionError { error, .. } => {
+                        warn!(?error, "incoming connection error");
+                    }
+                    _ => {}
                 }
             }
         }
@@ -843,33 +821,43 @@ async fn run_bench_windowed(
     Ok((started.elapsed(), meter.summarize()))
 }
 
-
 async fn receiver_loop(
     mut swarm: Swarm<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>>,
     topic: IdentTopic,
     local_peer: PeerId,
 ) -> Result<()> {
-    println!("=== Peer2 / Receiver ===");
-    println!("PeerId: {}", local_peer);
-    println!("Ждём DATA и отвечаем ACK автоматически.");
-    println!("Для udp/webrtc копируй полный multiaddr с /certhash/... из Listening on");
-    println!();
+    info!("=== Peer2 / Receiver ===");
+    info!(peer = %local_peer, "started");
 
     let mut metrics = Metrics::new();
 
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
-                println!("Listening on {}", address);
+                info!(%address, "listening");
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                info!(%peer_id, ?endpoint, "connection established");
                 swarm.behaviour_mut().add_explicit_peer(&peer_id);
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                warn!(%peer_id, ?cause, "connection closed");
                 swarm.behaviour_mut().remove_explicit_peer(&peer_id);
+            }
+            SwarmEvent::Behaviour(Event::Subscribed { peer_id, topic }) => {
+                info!(%peer_id, ?topic, "peer subscribed");
+            }
+            SwarmEvent::Behaviour(Event::Unsubscribed { peer_id, topic }) => {
+                info!(%peer_id, ?topic, "peer unsubscribed");
             }
             SwarmEvent::Behaviour(Event::Message { message, .. }) => {
                 handle_message(&mut swarm, &topic, local_peer, &mut metrics, &message).await;
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                warn!(?peer_id, ?error, "outgoing connection error");
+            }
+            SwarmEvent::IncomingConnectionError { error, .. } => {
+                warn!(?error, "incoming connection error");
             }
             _ => {}
         }
@@ -897,7 +885,7 @@ async fn sender_run_stack(
 
     println!("Connected + Subscribed. dial_ms={}", dial_time.as_millis());
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     let mut rows = Vec::new();
     let mut metrics = Metrics::new();
@@ -906,15 +894,9 @@ async fn sender_run_stack(
         println!("--- payload={} bytes ---", payload_size);
 
         for &requested in DEFAULT_COUNTS {
-            let (elapsed, rs) = run_bench_windowed(
-                &mut swarm,
-                &topic,
-                local_peer,
-                requested,
-                payload_size,
-                &mut metrics,
-            )
-            .await?;
+            let (elapsed, rs) =
+                run_bench_windowed(&mut swarm, &topic, local_peer, requested, payload_size, &mut metrics)
+                    .await?;
 
             let sent = metrics.data_sent;
             let delivered = metrics.data_delivered;
@@ -1033,8 +1015,16 @@ async fn sender_single_mode(
     Ok(())
 }
 
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(filter).with_target(true).compact().init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
+
     let mut stdin = io::BufReader::new(io::stdin()).lines();
 
     println!("role: receiver(peer2) | sender(peer1)");
@@ -1131,21 +1121,10 @@ async fn main() -> Result<()> {
                 "window(IN_FLIGHT) = {} | payloads={:?} | counts={:?}",
                 IN_FLIGHT, PAYLOAD_SIZES, DEFAULT_COUNTS
             );
-            println!(
-                "gossipsub.max_transmit_size = {} bytes\n",
-                GOSSIPSUB_MAX_TRANSMIT_SIZE
-            );
+            println!("gossipsub.max_transmit_size = {} bytes\n", GOSSIPSUB_MAX_TRANSMIT_SIZE);
 
             if stack == Stack::All {
-                return sender_all_mode(
-                    &id_keys,
-                    local_peer,
-                    remote_peer,
-                    ip,
-                    base_port,
-                    webrtc_full,
-                )
-                .await;
+                return sender_all_mode(&id_keys, local_peer, remote_peer, ip, base_port, webrtc_full).await;
             }
 
             let transport = build_transport_single(stack, &id_keys, HashMap::new())?;
