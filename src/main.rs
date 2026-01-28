@@ -130,7 +130,7 @@ struct Metrics {
     next_id: u64,
 
     duplicates: u64,
-    seen_data_ids: HashSet<u64>,
+    seen_data_ids: HashSet<(PeerId, u64)>,
 }
 
 impl Metrics {
@@ -622,15 +622,20 @@ async fn handle_message(
                 if sender == local_peer {
                     return;
                 }
+                let key = (sender, id);
 
                 let first_seen = if metrics.seen_data_ids.len() < MAX_SEEN_IDS {
-                    metrics.seen_data_ids.insert(id)
+                    metrics.seen_data_ids.insert(key)
                 } else {
                     true
                 };
 
+
+                
+
                 if !first_seen {
                     metrics.duplicates = metrics.duplicates.saturating_add(1);
+                    tracing::debug!(%sender, id, "duplicate DATA -> drop (no ACK)");
                     return;
                 }
 
