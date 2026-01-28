@@ -808,35 +808,9 @@ async fn run_bench_windowed(
                     break;
                 }
             }
-
-            let id = metrics.alloc_id();
-            let msg = encode_data(id, &local_peer, &payload);
-
-            match swarm.behaviour_mut().publish(topic.clone(), msg.clone()) {
-                Ok(_) => {
-                    metrics.note_data_send(id, msg.len(), payload.len());
-                    sent_total += 1;
-                }
-                Err(PublishError::NoPeersSubscribedToTopic) => {
-                    metrics.note_publish_failed();
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(PublishError::Duplicate) => {
-                    metrics.note_publish_failed();
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                Err(e) => {
-                    metrics.note_publish_failed();
-                    eprintln!(
-                        "[sender] publish DATA failed: {:?} (payload={}B msg_len={}B)",
-                        e,
-                        payload.len(),
-                        msg.len()
-                    );
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }
         }
+
+        tokio::task::yield_now().await;
 
         if sent_total == requested && metrics.pending.is_empty() {
             break;
@@ -868,6 +842,7 @@ async fn run_bench_windowed(
 
     Ok((started.elapsed(), meter.summarize()))
 }
+
 
 async fn receiver_loop(
     mut swarm: Swarm<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>>,
