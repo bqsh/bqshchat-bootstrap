@@ -1,32 +1,35 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use libp2p::{
+    Multiaddr, PeerId,
     core::{
         muxing::StreamMuxerBox,
-        transport::{upgrade::Version, Boxed, Transport},
+        transport::{Boxed, Transport, upgrade::Version},
     },
     gossipsub::{
-        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour, ConfigBuilder as GossipsubConfigBuilder, Event,
-        IdentTopic, IdentityTransform, MessageAuthenticity, MessageId, PublishError, TopicHash, ValidationMode,
+        AllowAllSubscriptionFilter, Behaviour as GossipBehaviour,
+        ConfigBuilder as GossipsubConfigBuilder, Event, IdentTopic, IdentityTransform,
+        MessageAuthenticity, MessageId, PublishError, TopicHash, ValidationMode,
     },
     identity,
     noise::Config as NoiseConfig,
     swarm::{Config as SwarmConfig, Swarm, SwarmEvent},
-    tcp::{tokio::Transport as TcpTransport, Config as TcpConfig},
+    tcp::{Config as TcpConfig, tokio::Transport as TcpTransport},
     websocket,
     yamux::Config as YamuxConfig,
-    Multiaddr, PeerId,
 };
 use libp2p_tokio_socks5::{Socks5Config, Socks5Transport};
 use rand::thread_rng;
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
     time::{Duration, Instant},
 };
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{
+    CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
+};
 use tokio::io::{self, AsyncBufReadExt};
 use tokio::time;
 
@@ -230,12 +233,16 @@ impl Metrics {
             }
 
             self.data_delivered = self.data_delivered.saturating_add(1);
-            self.payload_bytes_delivered = self.payload_bytes_delivered.saturating_add(payload_bytes as u64);
+            self.payload_bytes_delivered = self
+                .payload_bytes_delivered
+                .saturating_add(payload_bytes as u64);
         }
     }
 
     fn note_payload_delivered_receiver_side(&mut self, payload_bytes: usize) {
-        self.payload_bytes_delivered = self.payload_bytes_delivered.saturating_add(payload_bytes as u64);
+        self.payload_bytes_delivered = self
+            .payload_bytes_delivered
+            .saturating_add(payload_bytes as u64);
     }
 
     fn delivery_percent(&self) -> f64 {
@@ -285,8 +292,15 @@ fn percentile_us(v: &[u64], p: f64) -> Option<u64> {
 }
 
 enum ParsedMsg<'a> {
-    Data { id: u64, sender: PeerId, payload: &'a [u8] },
-    Ack { id: u64, target: PeerId },
+    Data {
+        id: u64,
+        sender: PeerId,
+        payload: &'a [u8],
+    },
+    Ack {
+        id: u64,
+        target: PeerId,
+    },
 }
 
 fn encode_data(id: u64, sender: &PeerId, payload: &[u8]) -> Vec<u8> {
@@ -331,7 +345,11 @@ fn decode_msg(bytes: &[u8]) -> Option<ParsedMsg<'_>> {
     match kind {
         KIND_DATA => {
             let payload = &bytes[10 + len..];
-            Some(ParsedMsg::Data { id, sender: peer, payload })
+            Some(ParsedMsg::Data {
+                id,
+                sender: peer,
+                payload,
+            })
         }
         KIND_ACK => Some(ParsedMsg::Ack { id, target: peer }),
         _ => None,
@@ -478,7 +496,11 @@ fn dial_addr_for_stack(
                 "Для udp/webrtc нужен полный multiaddr с /certhash/.../p2p/... (скопируй из Peer2 логов)"
             ));
         }
-        Stack::Tor => return Err(anyhow!("Tor dial requires onion multiaddr (пока не автоматизировали)")),
+        Stack::Tor => {
+            return Err(anyhow!(
+                "Tor dial requires onion multiaddr (пока не автоматизировали)"
+            ));
+        }
         Stack::All => return Err(anyhow!("use per-stack dial in all mode")),
     };
 
@@ -571,13 +593,31 @@ struct BenchRow {
 
 fn print_table(rows: &[BenchRow]) {
     println!();
-    println!("-------------------------------------------------------------------------------------------------------------------------------------------------------------------");
+    println!(
+        "-------------------------------------------------------------------------------------------------------------------------------------------------------------------"
+    );
     println!(
         "{:>6} | {:>7} | {:>8} | {:>7} | {:>7} | {:>7} | {:>7} | {:>8} | {:>9} | {:>9} | {:>9} | {:>8} | {:>9} | {:>9} | {:>7} | {:>7}",
-        "stack", "payload", "req", "sent", "deliv", "fail", "dialms",
-        "deliv%", "medianus", "p95us", "p99us", "jitter", "goodput", "overhead", "cpu", "mem"
+        "stack",
+        "payload",
+        "req",
+        "sent",
+        "deliv",
+        "fail",
+        "dialms",
+        "deliv%",
+        "medianus",
+        "p95us",
+        "p99us",
+        "jitter",
+        "goodput",
+        "overhead",
+        "cpu",
+        "mem"
     );
-    println!("-------------------------------------------------------------------------------------------------------------------------------------------------------------------");
+    println!(
+        "-------------------------------------------------------------------------------------------------------------------------------------------------------------------"
+    );
 
     for r in rows {
         println!(
@@ -590,9 +630,15 @@ fn print_table(rows: &[BenchRow]) {
             r.publish_failed,
             r.dial_ms,
             r.delivery_percent,
-            r.median_us.map(|x| x.to_string()).unwrap_or_else(|| "n/a".into()),
-            r.p95_us.map(|x| x.to_string()).unwrap_or_else(|| "n/a".into()),
-            r.p99_us.map(|x| x.to_string()).unwrap_or_else(|| "n/a".into()),
+            r.median_us
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "n/a".into()),
+            r.p95_us
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "n/a".into()),
+            r.p99_us
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "n/a".into()),
             r.jitter_us,
             r.goodput_mbps,
             r.overhead,
@@ -601,7 +647,9 @@ fn print_table(rows: &[BenchRow]) {
         );
     }
 
-    println!("-------------------------------------------------------------------------------------------------------------------------------------------------------------------");
+    println!(
+        "-------------------------------------------------------------------------------------------------------------------------------------------------------------------"
+    );
     println!();
 }
 
@@ -616,7 +664,11 @@ async fn handle_message(
 
     if let Some(parsed) = decode_msg(&msg.data) {
         match parsed {
-            ParsedMsg::Data { id, sender, payload } => {
+            ParsedMsg::Data {
+                id,
+                sender,
+                payload,
+            } => {
                 if sender == local_peer {
                     return;
                 }
@@ -725,6 +777,38 @@ async fn run_bench_windowed(
 
     loop {
         while sent_total < requested && metrics.pending.len() < IN_FLIGHT {
+            if started.elapsed() > RUN_TIMEOUT {
+                break;
+            }
+
+            let id = metrics.alloc_id();
+            let msg = encode_data(id, &local_peer, &payload);
+
+            match swarm.behaviour_mut().publish(topic.clone(), msg.clone()) {
+                Ok(_) => {
+                    metrics.note_data_send(id, msg.len(), payload.len());
+                    sent_total += 1;
+                }
+                Err(PublishError::NoPeersSubscribedToTopic) => {
+                    metrics.note_publish_failed();
+                    break;
+                }
+                Err(PublishError::Duplicate) => {
+                    metrics.note_publish_failed();
+                    break;
+                }
+                Err(e) => {
+                    metrics.note_publish_failed();
+                    eprintln!(
+                        "[sender] publish DATA failed: {:?} (payload={}B msg_len={}B)",
+                        e,
+                        payload.len(),
+                        msg.len()
+                    );
+                    break;
+                }
+            }
+
             let id = metrics.alloc_id();
             let msg = encode_data(id, &local_peer, &payload);
 
@@ -1072,7 +1156,10 @@ async fn main() -> Result<()> {
                 "window(IN_FLIGHT) = {} | payloads={:?} | counts={:?}",
                 IN_FLIGHT, PAYLOAD_SIZES, DEFAULT_COUNTS
             );
-            println!("gossipsub.max_transmit_size = {} bytes\n", GOSSIPSUB_MAX_TRANSMIT_SIZE);
+            println!(
+                "gossipsub.max_transmit_size = {} bytes\n",
+                GOSSIPSUB_MAX_TRANSMIT_SIZE
+            );
 
             if stack == Stack::All {
                 return sender_all_mode(
