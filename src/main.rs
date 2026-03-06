@@ -630,9 +630,6 @@ async fn handle_message(
                     true
                 };
 
-
-                
-
                 if !first_seen {
                     metrics.duplicates = metrics.duplicates.saturating_add(1);
                     tracing::debug!(%sender, id, "duplicate DATA -> drop (no ACK)");
@@ -667,7 +664,7 @@ async fn dial_wait_ready(
     remote_peer: PeerId,
     topic_hash: TopicHash,
     timeout: Duration,
-) -> Result<Duration> {
+    ) -> Result<Duration> {
     let t0 = Instant::now();
 
     swarm.behaviour_mut().add_explicit_peer(&remote_peer);
@@ -952,8 +949,6 @@ async fn sender_run_stack(
 }
 
 async fn sender_all_mode(
-    id_keys: &identity::Keypair,
-    local_peer: PeerId,
     remote_peer: PeerId,
     ip: IpAddr,
     base_port: u16,
@@ -975,10 +970,17 @@ async fn sender_all_mode(
             port_for_stack(base_port, st)
         );
 
-        let transport = build_transport_single(st, id_keys, HashMap::new())?;
-        let behaviour = make_gossipsub(id_keys)?;
+        let id_keys = identity::Keypair::generate_ed25519();
+        let local_peer = PeerId::from(id_keys.public());
+
+        let transport = build_transport_single(st, &id_keys, HashMap::new())?;
+        let behaviour = make_gossipsub(&id_keys)?;
         let swarm_config = SwarmConfig::with_tokio_executor();
         let mut swarm = Swarm::new(transport, behaviour, local_peer, swarm_config);
+
+        if st == Stack::WebRtcUdp {
+            swarm.listen_on("/ip4/0.0.0.0/udp/0/webrtc-direct".parse()?)?;
+        }
 
         let topic = IdentTopic::new("forum/autos/board/general");
         swarm.behaviour_mut().subscribe(&topic)?;
@@ -1009,6 +1011,10 @@ async fn sender_single_mode(
     let behaviour = make_gossipsub(id_keys)?;
     let swarm_config = SwarmConfig::with_tokio_executor();
     let mut swarm = Swarm::new(transport, behaviour, local_peer, swarm_config);
+
+    if stack == Stack::WebRtcUdp {
+        swarm.listen_on("/ip4/0.0.0.0/udp/0/webrtc-direct".parse()?)?;
+    }
 
     let topic = IdentTopic::new("forum/autos/board/general");
     swarm.behaviour_mut().subscribe(&topic)?;
@@ -1129,7 +1135,7 @@ async fn main() -> Result<()> {
             println!("gossipsub.max_transmit_size = {} bytes\n", GOSSIPSUB_MAX_TRANSMIT_SIZE);
 
             if stack == Stack::All {
-                return sender_all_mode(&id_keys, local_peer, remote_peer, ip, base_port, webrtc_full).await;
+                return sender_all_mode(remote_peer, ip, base_port, webrtc_full).await;
             }
 
             let transport = build_transport_single(stack, &id_keys, HashMap::new())?;
