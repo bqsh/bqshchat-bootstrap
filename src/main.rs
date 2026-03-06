@@ -37,10 +37,10 @@ use tracing::{debug, error, info, warn};
 const KIND_DATA: u8 = 1;
 const KIND_ACK: u8 = 2;
 
-const DEFAULT_COUNTS: &[usize] = &[1, 10, 100, 1000];
+const DEFAULT_COUNTS: &[usize] = &[1000];
 const PAYLOAD_SIZES: &[usize] = &[32, 1024, 4096];
 
-const IN_FLIGHT: usize = 100;
+const IN_FLIGHT: usize = 1000;
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 const DIAL_READY_TIMEOUT: Duration = Duration::from_secs(20);
