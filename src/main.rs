@@ -443,7 +443,7 @@ async fn handle_message(swarm: &mut Swarm<GossipBehaviour<IdentityTransform, All
 
 async fn dial_wait_ready(swarm: &mut Swarm<GossipBehaviour<IdentityTransform, AllowAllSubscriptionFilter>>, addr: Multiaddr, peer: PeerId, th: TopicHash, timeout: Duration) -> Result<Duration> {
     let t0 = Instant::now();
-    swarm.behaviour_mut().add_explicit_peer(&peer);
+    
     let _ = swarm.dial(addr);
     let deadline = Instant::now() + timeout;
     let (mut c, mut s) = (false, false);
@@ -503,7 +503,6 @@ async fn receiver_loop(mut swarm: Swarm<GossipBehaviour<IdentityTransform, Allow
             SwarmEvent::NewListenAddr { address, .. } => info!("Listen: {}", address),
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 info!("Connected: {}", peer_id);
-                swarm.behaviour_mut().add_explicit_peer(&peer_id);
             }
             SwarmEvent::Behaviour(Event::Message { message, .. }) => handle_message(&mut swarm, &topic, local, &mut m, &message).await,
             _ => {}
