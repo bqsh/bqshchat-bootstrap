@@ -43,7 +43,7 @@ use tracing::{debug, error, info, warn};
 const KIND_DATA: u8 = 1;
 const KIND_ACK: u8 = 2;
 
-const DEFAULT_COUNTS: &[usize] = &[1000, 10000, 50000];
+const DEFAULT_COUNTS: &[usize] = &[100, 1000, 5000];
 const PAYLOAD_SIZES: &[usize] = &[32, 1024, 4096];
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
